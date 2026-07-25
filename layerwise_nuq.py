@@ -1,99 +1,322 @@
-import argparse
-from any_precision.quantization import layerwise_nuq
-import torch, functools
-torch.load = functools.partial(torch.load, weights_only=False)
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
+"""
+Uniform LNQ + GuidedQuant solver.
+========================================================================
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Quantize a model to any precision")
-    parser.add_argument("model", type=str, help="The model to quantize")
-    parser.add_argument("--seed_precision", type=int, help="The precision to quantize the seed to")
-    parser.add_argument("--mode", type=str, default="pack", help="The mode to run in")
-    parser.add_argument("--yaml_path", type=str, help="The path to the architecture config yaml file")
-    parser.add_argument("--cache_dir", type=str, help="The directory to cache results in")
-    parser.add_argument("--dataset", type=str, help="The dataset to use")
-    parser.add_argument("--seq_len", type=int, help="The sequence length to use")
-    parser.add_argument("--num_examples", type=int, help="The number of examples to use")
-    parser.add_argument("--cpu_count", type=int, help="The number of CPUs to use for parallelization")
-    parser.add_argument("--overwrite_quantize", action="store_true",
-                        help="Whether to overwrite the quantized model stored to disk")
-    parser.add_argument("--overwrite_pack", action="store_true",
-                        help="Whether to overwrite the packed model stored to disk")
-    parser.add_argument("--random_state", type=int,
-                        help="The random state to use for reproducibility\n"
-                             "[WARNING] May not be reproducible across different machines")
-    parser.add_argument("--sub_hessian", nargs='+', type=int, default=None,
-                         help="(start, end) of layers to use for hessian saving")
-    parser.add_argument("--num_groups", type=int, default=4,
-                        help="Number of groups $g$ to use for GuidedQuant Hessian")
-    parser.add_argument("--num_iterations", type=int, default=3,
-                        help="Number of iterations to run")
-    parser.add_argument('--cd_cycles', type=int, default=4,
-                        help='Number of CD cycles to run')
-    parser.add_argument("--sub_qlayer", nargs='+', type=int, default=None,
-                        help="(start, end) of layers to use for quantization")
-    parser.add_argument("--is_nosal", type=str2bool, default=False,
-                        help="Do not use GuidedQuant Hessian")
-    parser.add_argument("--model_name", type=str, default=None,
-                    help="Stable short name for cache paths (defaults to basename of model path)")
-    parser.add_argument("--solver", type=str, default="lnq",
-                        choices=["lnq", "flexnu", "lnqflexnu", "lnqbopt", "uniform"])
-    parser.add_argument("--uniform_symmetric", type=str2bool, default=True,
-                        help="Uniform solver: symmetric grid (z=0) vs asymmetric (learn zero-point)")
-    # --- staged B-opt knobs (only used when --solver lnqbopt) ---
-    parser.add_argument("--bopt_stages", type=int, default=1,
-                        help="1=B2 gating pass, 2=+B3, 3=+ejection chains")
-    parser.add_argument("--bopt_nu", type=int, default=32)
-    parser.add_argument("--bopt_top_p", type=int, default=200)
-    parser.add_argument("--bopt_kappa1", type=float, default=2.0)
-    parser.add_argument("--bopt_max_cd_sweeps", type=int, default=20)
-    parser.add_argument("--bopt_chain_depth", type=int, default=18)
-    parser.add_argument("--bopt_n_chains", type=int, default=200)
-    parser.add_argument("--bopt_b2_max_passes", type=int, default=8,
-                        help="Restricted-VND passes for B=2 (1 safe move/channel "
-                             "per pass; iterate to a 2-opt fixed point)")
-    parser.add_argument("--bopt_verbose", type=str2bool, default=True,
-                        help="Per-group/per-stage §2.6 instrumentation (funnel, "
-                             "level-jumps, calib-vs-holdout)")
-    parser.add_argument("--flexnu_iters", type=int, default=300)
-    parser.add_argument("--flexnu_lr_scale", type=float, default=3e-3)
-    parser.add_argument("--flexnu_lr_cb", type=float, default=1e-5)
-    parser.add_argument("--flexnu_row_block", type=int, default=64)
-    parser.add_argument("--flexnu_tau_frac", type=float, default=0.5)
-    parser.add_argument("--flexnu_stage_frac", type=float, default=0.0)
-    parser.add_argument("--flexnu_eval_every", type=int, default=1)
-    parser.add_argument("--flexnu_signed_g", type=str2bool, default=False,
-                        help="signed multiplier G = exp(g+)-exp(g-); enables sign-crossing reassignments")
-    parser.add_argument("--flexnu_signed_eps", type=float, default=0.05,
-                        help="flip resistance; damping = (1+eps)/eps")
-    parser.add_argument("--flexnu_lambda_tv", type=float, default=0.0,
-                        help="TV penalty on |exp(g+)|+|exp(g-)|")
-    parser.add_argument("--flexnu_freeze_codebook", type=str2bool, default=False)
-    parser.add_argument("--flexnu_freeze_scale", type=str2bool, default=False)
-    parser.add_argument("--flexnu_delta_init_noise", type=float, default=0.0)
-    args = parser.parse_args()
-    args.sub_hessian = tuple(args.sub_hessian) if args.sub_hessian else None
-    args.sub_qlayer = tuple(args.sub_qlayer) if args.sub_qlayer else None
+Drop-in sibling of `train_least_squares` (LNQ) in layerwise_quantize.py, but
+for a UNIFORM affine grid instead of a free non-uniform codebook.
 
-    # only pass options that are not None
-    fk = {k[len("flexnu_"):]: v for k, v in vars(args).items()
-          if k.startswith("flexnu_") and v is not None}
-    # B-opt knobs ride the same passthrough dict; the lnqbopt branch pops them.
-    for k, v in vars(args).items():
-        if k.startswith("bopt_") and v is not None:
-            fk[k] = v
-    # uniform solver knobs ride the same passthrough dict.
-    for k, v in vars(args).items():
-        if k.startswith("uniform_") and v is not None:
-            fk[k] = v
-    kw = {k: v for k, v in vars(args).items()
-      if v is not None and not k.startswith("flexnu_") and not k.startswith("bopt_")
-      and not k.startswith("uniform_")}
-    kw["flexnu_kwargs"] = fk
-    layerwise_nuq(**kw)
+Key differences vs LNQ (non-uniform):
+
+  * NO SqueezeLLM init. The codebook is not free, so there is nothing to seed
+    from an external k-means. We build the uniform grid directly from W with an
+    H-weighted MSE scale search (see `_init_uniform`). `init_labels` and
+    `init_centroids` passed in by the caller are IGNORED.
+
+  * The codebook C is CONSTRAINED to an affine lattice per output channel j:
+
+        C[j, q] = s_j * level[q] + z_j            (asymmetric)
+        C[j, q] = s_j * level[q]                   (symmetric,  z_j = 0)
+
+    where `level` is the FIXED integer grid  {qmin, ..., qmax},
+    m = 2**bit levels.  Only (s_j, z_j) are optimized -- 1 or 2 dof per row,
+    replacing LNQ's m free codebook values.
+
+  * update_C  -->  update_scale : the free least-squares codebook solve
+        c* = (P^T H P)^-1 P^T H w        (LNQ Eq. 9)
+    collapses to the exact minimizer over the affine params. Stacking
+        A_j = [ q_j , 1 ]   (asymmetric)   or   A_j = [ q_j ]  (symmetric),
+        [s_j, z_j]^T = (A_j^T H A_j)^-1 A_j^T H w_j.
+    This is Eq. (9) restricted to a 1- or 2-column basis.
+
+  * update_P (the CD assignment sweep) is REUSED UNCHANGED from LNQ. Because we
+    always materialize the current affine grid into a dense `C` of shape
+    (output_dim, m) before calling update_P, the coordinate-wise closed-form CD
+    update (with precompute + lazy batch-updates) rounds to the correct uniform
+    levels automatically -- "nearest of m codewords" == "nearest uniform level"
+    when the m codewords ARE the uniform levels. No kernel edit needed.
+
+GuidedQuant enters ONLY through H (the saliency-weighted group Hessian
+H_k = X^T diag(s_k) X). Both update_P and update_scale consume H, so they are
+saliency-weighted automatically; this file is unaware of it.
+
+Output contract is identical to LNQ: returns (labels, C, log_dict) with
+  labels : (output_dim, input_dim)  uint-ish int assignments into the grid
+  C      : (output_dim, m)           the *materialized* affine grid (fp32)
+so packing / dequant / eval are untouched.
+"""
+
+import logging
+import time
+import numpy as np
+import torch
+
+# Reuse LNQ's exact CD assignment sweep and objective -- do NOT reimplement.
+from .layerwise_quantize import update_P, objective_function
+
+
+# --------------------------------------------------------------------------- #
+#  Grid helpers
+# --------------------------------------------------------------------------- #
+def _levels(bit: int, symmetric: bool, device, dtype=torch.float32) -> torch.Tensor:
+    """
+    Fixed integer levels of the uniform grid, shape (m,), m = 2**bit.
+
+    symmetric:  {-2^(b-1)+1, ..., 2^(b-1)-1, ...}  centered, includes 0
+                (we use the range [-(2^(b-1)-1), 2^(b-1)-1] padded to m entries
+                 by including -2^(b-1); standard signed range)
+    asymmetric: {0, 1, ..., m-1}
+    """
+    m = 2 ** bit
+    if symmetric:
+        qmin = -(2 ** (bit - 1))
+        qmax = 2 ** (bit - 1) - 1
+        lv = torch.arange(qmin, qmax + 1, device=device, dtype=dtype)
+    else:
+        lv = torch.arange(0, m, device=device, dtype=dtype)
+    assert lv.numel() == m, (lv.numel(), m)
+    return lv
+
+
+def _materialize_C(level: torch.Tensor, s: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """
+    Build dense per-channel codebook from affine params.
+      level : (m,)
+      s     : (output_dim, 1)
+      z     : (output_dim, 1)
+    returns C : (output_dim, m),   C[j,q] = s_j * level[q] + z_j
+    """
+    return s * level.unsqueeze(0) + z  # (output_dim, m)
+
+
+# --------------------------------------------------------------------------- #
+#  Uniform init  (replaces SqueezeLLM init)  -- H-weighted MSE scale search
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def _init_uniform(
+    W: torch.Tensor,          # (output_dim, input_dim)  on cuda
+    H: torch.Tensor,          # (num_groups, input_dim, input_dim) on cuda
+    level: torch.Tensor,      # (m,)
+    symmetric: bool,
+    n_scale_grid: int = 24,
+    alpha_min: float = 0.55,
+    alpha_max: float = 1.0,
+):
+    """
+    Per output channel, pick (s_j, z_j) minimizing the H-weighted reconstruction
+    error over a small grid of clipping ratios alpha, then round to get labels.
+    Returns (labels, s, z, C) with s,z shape (output_dim,1) and C materialized.
+    """
+    device = W.device
+    out_dim, in_dim = W.shape
+    num_groups = H.shape[0]
+    group_size = out_dim // num_groups
+    lvmin, lvmax = level.min(), level.max()
+
+    if symmetric:
+        wmax = W.abs().amax(dim=1, keepdim=True)                  # (out,1)
+        base_s = wmax / lvmax
+        z_fixed = torch.zeros_like(base_s)
+    else:
+        wmin = W.amin(dim=1, keepdim=True)
+        wmax = W.amax(dim=1, keepdim=True)
+        base_s = (wmax - wmin) / (lvmax - lvmin)
+        z_fixed = wmin - lvmin * base_s  # so that level=lvmin maps to wmin
+
+    base_s = base_s.clamp_min(1e-12)
+
+    alphas = torch.linspace(alpha_max, alpha_min, n_scale_grid, device=device)
+
+    best_err = torch.full((out_dim,), float("inf"), device=device)
+    best_s = base_s.clone()
+    best_z = z_fixed.clone()
+
+    # diag(H) per group, broadcast to rows -- cheap proxy inside the search loop
+    # (full H-weighted error is used for the *final* selection below).
+    for a in alphas:
+        s = base_s * a
+        if symmetric:
+            z = torch.zeros_like(s)
+        else:
+            # keep zero-point consistent with clipped range
+            z = wmin - lvmin * s
+        # round to grid
+        q = torch.clamp(torch.round((W - z) / s), lvmin, lvmax)   # (out,in)
+        W_hat = s * q + z
+        dW = (W_hat - W).reshape(num_groups, group_size, in_dim)
+        # H-weighted per-row error:  sum_i dW_i^T H dW_i  (diagonal-of-groups)
+        err = torch.einsum('nij,njk,nik->ni', dW, H, dW).reshape(out_dim)
+        improved = err < best_err
+        best_err = torch.where(improved, err, best_err)
+        best_s = torch.where(improved.unsqueeze(1), s, best_s)
+        best_z = torch.where(improved.unsqueeze(1), z, best_z)
+
+    # final labels under the chosen (s,z)
+    q = torch.clamp(torch.round((W - best_z) / best_s), lvmin, lvmax)   # (out,in)
+    labels = (q - lvmin).round().long()                                # index into level[]
+    C = _materialize_C(level, best_s, best_z)
+    return labels, best_s, best_z, C
+
+
+# --------------------------------------------------------------------------- #
+#  Scale/zero-point update  (replaces update_C)
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def update_scale(
+    W: torch.Tensor,        # (output_dim, input_dim)  cuda
+    H: torch.Tensor,        # (num_groups, input_dim, input_dim) cuda
+    labels: torch.Tensor,   # (output_dim, input_dim)  long, index into level[]
+    level: torch.Tensor,    # (m,)
+    symmetric: bool,
+    sub_channel_size: int = 64,
+):
+    """
+    Exact minimizer of  sum_i (s q_i + z - w_i)^T H (s q_i + z - w_i)  over
+    (s_j, z_j) per output channel, using the same Cholesky-reduced formulation
+    as LNQ's update_C:  with H = L L^T, reduced_X = L^T, solve least squares on
+    A_j = [reduced_X q_j , reduced_X 1]  vs  reduced_X w_j.
+
+    Returns (s, z) each (output_dim, 1) and the materialized C (output_dim, m).
+    """
+    device = W.device
+    out_dim, in_dim = W.shape
+    num_groups = H.shape[0]
+    group_size = out_dim // num_groups
+
+    # integer code values q_ij = level[labels_ij]
+    q = level[labels]                       # (out, in)  float
+
+    # Cholesky per group  (H = L L^T), reduced_X = L^T   -> whitening
+    L = torch.empty_like(H)
+    for g in range(num_groups):
+        L[g] = torch.linalg.cholesky(H[g])
+    reduced_X = L.transpose(-2, -1)         # (num_groups, in, in)
+
+    s_out = torch.empty((out_dim, 1), device=device)
+    z_out = torch.empty((out_dim, 1), device=device)
+    ncol = 1 if symmetric else 2
+    ones_col = torch.ones((in_dim,), device=device)
+
+    for st in range(0, out_dim, sub_channel_size):
+        g = st // group_size
+        Xr = reduced_X[g]                   # (in, in)   L^T for this group
+        en = min(st + sub_channel_size, out_dim)
+        qb = q[st:en]                        # (bsz, in)
+        wb = W[st:en]                        # (bsz, in)
+        bsz = en - st
+
+        # b = Xr @ w_j   -> (bsz, in)   (whitened target)
+        b = torch.einsum('ij,bj->bi', Xr, wb)          # (bsz, in)
+        # a_scale = Xr @ q_j -> (bsz, in)
+        a_scale = torch.einsum('ij,bj->bi', Xr, qb)    # (bsz, in)
+
+        if symmetric:
+            # s* = <a_scale, b> / <a_scale, a_scale>
+            num = (a_scale * b).sum(dim=1)
+            den = (a_scale * a_scale).sum(dim=1).clamp_min(1e-12)
+            s = (num / den).unsqueeze(1)               # (bsz,1)
+            s_out[st:en] = s
+            z_out[st:en] = 0.0
+        else:
+            # a_z = Xr @ 1  (same for all rows in this group)
+            a_z = (Xr @ ones_col).unsqueeze(0).expand(bsz, -1)   # (bsz, in)
+            # 2x2 normal equations per row:  [ <as,as> <as,az> ; . <az,az> ]
+            saa = (a_scale * a_scale).sum(dim=1)
+            saz = (a_scale * a_z).sum(dim=1)
+            zaa = (a_z * a_z).sum(dim=1)
+            bs = (a_scale * b).sum(dim=1)
+            bz = (a_z * b).sum(dim=1)
+            det = (saa * zaa - saz * saz).clamp_min(1e-12)
+            s = (zaa * bs - saz * bz) / det
+            z = (saa * bz - saz * bs) / det
+            s_out[st:en] = s.unsqueeze(1)
+            z_out[st:en] = z.unsqueeze(1)
+
+    s_out = s_out.clamp_min(1e-12)
+    C = _materialize_C(level, s_out, z_out)
+    return s_out, z_out, C
+
+
+# --------------------------------------------------------------------------- #
+#  Main alternating loop  (mirrors train_least_squares)
+# --------------------------------------------------------------------------- #
+def train_uniform(
+    W: np.ndarray,               # (output_dim, input_dim)
+    init_labels: np.ndarray,     # IGNORED (kept for signature compatibility)
+    init_centroids: np.ndarray,  # IGNORED
+    H: np.ndarray,               # (num_groups, input_dim, input_dim)
+    seed_bit: int,
+    num_iterations: int = 3,
+    cd_cycles: int = 4,
+    symmetric: bool = True,
+):
+    device = torch.device("cuda")
+
+    W = torch.tensor(W, dtype=torch.float32, device=device)
+    H = torch.tensor(H, dtype=torch.float32, device=device)
+
+    # --- PD damping (same as LNQ) ---
+    diag = torch.arange(H.shape[1], device=device)
+    for i in range(H.shape[0]):
+        avg_diag = torch.mean(torch.diag(H[i]))
+        damp, prev_damp = 1e-5, 0.
+        while True:
+            try:
+                torch.linalg.cholesky(H[i])
+                logging.info(f"{i+1}-th H is PD, dampening factor={prev_damp:.2e}")
+                break
+            except Exception as e:
+                logging.info(f"{i+1}-th H not PD, dampening factor={damp:.2e}")
+                H[i, diag, diag] += (damp - prev_damp) * avg_diag
+                prev_damp = damp
+                damp *= 10
+                if damp > 1e0:
+                    raise RuntimeError("H could not be made PD")
+
+    level = _levels(seed_bit, symmetric, device)     # (m,)
+
+    # --- Uniform init (replaces SqueezeLLM) ---
+    labels, s, z, C = _init_uniform(W, H, level, symmetric)
+    labels = labels.to(device)
+
+    best_obj = objective_function(W, H, labels.cpu(), C.cpu()).item()
+    best_labels, best_C = labels.detach().cpu().clone(), C.detach().cpu().clone()
+    logging.info(f"[uniform] Initial objective: {best_obj:.6f}")
+
+    log_dict = {"objective": [best_obj], "iteration": [0]}
+
+    for iteration in range(num_iterations):
+        t0 = time.time()
+
+        # ----- Update P (CD assignment sweep) : LNQ's update_P, UNCHANGED -----
+        if iteration > 0:
+            # update_P expects C on the current grid; pass materialized C.
+            labels = update_P(W, H, labels, C, cd_cycles=cd_cycles)
+
+        obj_p = objective_function(W, H, labels.cpu(), C.cpu()).item()
+        logging.info(f"[uniform] Iter {iteration+1} (P): {obj_p:.4f}")
+        log_dict["objective"].append(obj_p)
+        log_dict["iteration"].append(iteration + 1)
+
+        # ----- Update scale/zero-point (replaces update_C) -----
+        s, z, C = update_scale(W, H, labels, level, symmetric)
+
+        obj_c = objective_function(W, H, labels.cpu(), C.cpu()).item()
+        log_dict["objective"].append(obj_c)
+        log_dict["iteration"].append(iteration + 1)
+
+        if obj_c < best_obj:
+            best_obj = obj_c
+            best_labels = labels.detach().cpu().clone()
+            best_C = C.detach().cpu().clone()
+            logging.info(f"[uniform] Iter {iteration+1} (S): {obj_c:.4f} | improved")
+        else:
+            logging.info(f"[uniform] Iter {iteration+1} (S): {obj_c:.4f} | not improved, stop")
+            labels, C = best_labels.to(device), best_C.to(device)
+            break
+
+        logging.info(f"[uniform] Iter {iteration+1}/{num_iterations} "
+                     f"done in {time.time()-t0:.2f}s")
+
+    labels = best_labels.detach().cpu().numpy()   # (out, in) int, index into level[]
+    C = best_C.detach().cpu().numpy().astype(np.float32)
+    return labels, C, log_dict
