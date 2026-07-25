@@ -50,8 +50,10 @@ import time
 import numpy as np
 import torch
 
-# Reuse LNQ's exact CD assignment sweep and objective -- do NOT reimplement.
-from .layerwise_quantize import update_P, objective_function
+# NOTE: update_P and objective_function are imported LAZILY inside the functions
+# below (not at module top) to avoid a circular import: layerwise_quantize.py
+# imports train_uniform from this file at its top, so importing back from it here
+# at import-time would hit a partially-initialized module.
 
 
 # --------------------------------------------------------------------------- #
@@ -249,6 +251,9 @@ def train_uniform(
     cd_cycles: int = 4,
     symmetric: bool = True,
 ):
+    # lazy import to break circular dependency with layerwise_quantize
+    from .layerwise_quantize import update_P, objective_function
+
     device = torch.device("cuda")
 
     W = torch.tensor(W, dtype=torch.float32, device=device)
