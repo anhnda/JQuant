@@ -1,4 +1,3 @@
-
 import os
 import os.path
 import shutil
@@ -155,7 +154,11 @@ def layerwise_nuq(
 
     # ------------------- Check initialization cache -------------------
 
-    if not os.path.exists(initialization_cache_path):
+    # The uniform solver builds its grid directly from W (H-weighted MSE scale
+    # search) and IGNORES any SqueezeLLM init labels/centroids. So it does NOT
+    # require the init cache -- only the saliency-weighted Hessians. For every
+    # other solver the init cache is still mandatory.
+    if solver != "uniform" and not os.path.exists(initialization_cache_path):
         logging.info(f"Initialization cache path {initialization_cache_path} does not exist. Need to provide it.")
         return
 

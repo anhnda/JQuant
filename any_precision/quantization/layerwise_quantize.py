@@ -427,28 +427,40 @@ def fix_hessian_shape(H: torch.Tensor) -> torch.Tensor:
 
 
 def get_layer_loader(analyzer, module_names, initialization_path, hessians_path, seed_precision):
+    n_cluster = 2 ** seed_precision
+
     def layer_loader(l):
-        # Load the initialization data (labels and centroids)
-        init_labels_file_name = os.path.join(initialization_path, "weights", f"l{l}.pt")
-        init_labels = torch.load(init_labels_file_name)
-        init_centroids_file_name = os.path.join(initialization_path, f"lut_{seed_precision}", f"l{l}.pt")
-        init_centroids = torch.load(init_centroids_file_name)
         hessian_file_name = os.path.join(hessians_path, f"l{l}.pt")
         hessian = torch.load(hessian_file_name)
 
-        # Organize the data by module
-        init_labels_layer = [
-            init_labels[name] for name in module_names
-        ]
-        init_centroids_layer = [
-            init_centroids[name].astype(np.float32) for name in module_names
-        ]
-        hessian_layer = [
-            fix_hessian_shape(hessian[name]).float().numpy() for name in module_names
-        ]
         model_layer = [
             analyzer.get_layer_weights(l)[name].float().numpy()
             for name in module_names
+        ]
+
+        # Load the initialization data (labels and centroids). The uniform solver
+        # ignores these (it builds the grid from W), so if the SqueezeLLM init
+        # cache is absent we synthesize zero-init of the correct shape instead of
+        # failing. For non-uniform solvers the files must exist.
+        init_labels_file_name = os.path.join(initialization_path, "weights", f"l{l}.pt")
+        init_centroids_file_name = os.path.join(initialization_path, f"lut_{seed_precision}", f"l{l}.pt")
+        have_init = os.path.exists(init_labels_file_name) and os.path.exists(init_centroids_file_name)
+
+        if have_init:
+            init_labels = torch.load(init_labels_file_name)
+            init_centroids = torch.load(init_centroids_file_name)
+            init_labels_layer = [init_labels[name] for name in module_names]
+            init_centroids_layer = [init_centroids[name].astype(np.float32) for name in module_names]
+        else:
+            # dummy init: labels all-zero (out, in), centroids zeros (out, n_cluster)
+            init_labels_layer = [
+                np.zeros((w.shape[0], w.shape[1]), dtype=np.uint8) for w in model_layer
+            ]
+            init_centroids_layer = [
+                np.zeros((w.shape[0], n_cluster), dtype=np.float32) for w in model_layer
+            ]
+        hessian_layer = [
+            fix_hessian_shape(hessian[name]).float().numpy() for name in module_names
         ]
         return module_names, model_layer, init_labels_layer, init_centroids_layer, hessian_layer
 
