@@ -51,7 +51,6 @@ import numpy as np
 import torch
 
 # Reuse LNQ's exact CD assignment sweep and objective -- do NOT reimplement.
-from .layerwise_quantize import update_P, objective_function
 
 
 # --------------------------------------------------------------------------- #
